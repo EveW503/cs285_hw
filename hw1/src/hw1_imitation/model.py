@@ -46,13 +46,34 @@ class MSEPolicy(BasePolicy):
         hidden_dims: tuple[int, ...] = (128, 128),
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+        self.mlp = nn.Sequential(
+            nn.Linear(state_dim,hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0],hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1],hidden_dims[2]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[2],chunk_size*action_dim)
+        )
 
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        fn = nn.MSELoss()
+        batch_size = state.shape[0]
+        pred_n = self.mlp(state)
+        pred = torch.reshape(
+            pred_n,
+            (batch_size,self.chunk_size,
+            self.action_dim)
+        )
+        loss = fn(pred,action_chunk)
+        return loss
 
     def sample_actions(
         self,
@@ -60,7 +81,14 @@ class MSEPolicy(BasePolicy):
         *,
         num_steps: int = 10,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        batch_size = state.shape[0]
+        pred_n = self.mlp(state)
+        pred = torch.reshape(
+            pred_n,
+            (batch_size,self.chunk_size,
+            self.action_dim)
+            )
+        return pred
 
 
 class FlowMatchingPolicy(BasePolicy):
@@ -76,12 +104,54 @@ class FlowMatchingPolicy(BasePolicy):
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
 
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+
+        self.mlp = nn.Sequential(
+            nn.Linear(state_dim+1+chunk_size*action_dim,hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0],hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1],hidden_dims[2]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[2],chunk_size*action_dim)
+        )
+
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        
+        batch_size = state.shape[0]
+        action_noise = torch.randn_like(action_chunk)
+        tau = torch.rand(
+            (batch_size,1,1),
+            device=state.device,
+            dtype=state.dtype,
+        )
+
+        a_tau = (1 - tau)*action_noise + tau*action_chunk
+        vectory = action_chunk - action_noise
+
+        mlp_input = torch.cat(
+            [
+                state,
+                tau.reshape(batch_size,1),
+                a_tau.flatten(start_dim=1)
+            ],
+            dim=1,
+        )
+
+        fn = nn.MSELoss()
+
+        pred_n = self.mlp(mlp_input)
+        pred = pred_n.reshape_as(action_chunk)
+
+        loss = fn(pred,vectory)
+
+        return loss
 
     def sample_actions(
         self,
@@ -89,7 +159,40 @@ class FlowMatchingPolicy(BasePolicy):
         *,
         num_steps: int = 10,
     ) -> torch.Tensor:
-        raise NotImplementedError
+       batch_size = state.shape[0]
+
+    # 从标准正态噪声开始
+       actions = torch.randn(
+        (batch_size, self.chunk_size, self.action_dim),
+        device=state.device,
+        dtype=state.dtype,
+    )
+
+       dt = 1.0 / num_steps
+
+       for i in range(num_steps):
+        tau = torch.full(
+            (batch_size, 1),
+            i * dt,
+            device=state.device,
+            dtype=state.dtype,
+        )
+
+        net_input = torch.cat(
+            [
+                state,
+                tau,
+                actions.flatten(start_dim=1),
+            ],
+            dim=1,
+        )
+
+        velocity = self.mlp(net_input).reshape_as(actions)
+
+        # Euler 积分：根据当前速度向前走一步
+        actions = actions + dt * velocity
+
+       return actions  # (B, chunk_size, action_dim)
 
 
 PolicyType: TypeAlias = Literal["mse", "flow"]
